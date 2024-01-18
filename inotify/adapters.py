@@ -9,6 +9,8 @@ from errno import EINTR
 
 import fcntl
 
+from dataclasses import dataclass
+
 import inotify.constants
 import inotify.calls
 
@@ -27,28 +29,63 @@ _DEFAULT_TERMINAL_EVENTS = (
 _LOGGER = logging.getLogger(__name__)
 
 _INOTIFY_EVENT = collections.namedtuple(
-                    '_INOTIFY_EVENT',
-                    [
-                        'wd',
-                        'mask',
-                        'cookie',
-                        'len',
-                    ])
+    '_INOTIFY_EVENT',
+    [
+        'wd',
+        'mask',
+        'cookie',
+        'len',
+    ])
 
 _STRUCT_HEADER_LENGTH = struct.calcsize(_HEADER_STRUCT_FORMAT)
 _IS_DEBUG = bool(int(os.environ.get('DEBUG', '0')))
 
 
+#################################################
+# Exceptions:
 class EventTimeoutException(Exception):
-    pass
+    def __init__(self, *args):
+        super().__init__(*args)
+        return
 
 
 class TerminalEventException(Exception):
-    def __init__(self, type_name, event):
-        super(TerminalEventException, self).__init__(type_name)
+    def __init__(self, type_name, event, *args):
+        super(TerminalEventException, self).__init__(type_name, *args)
+        self.type_name = type_name
         self.event = event
+        return
 
 
+#################################################
+# Header data class:
+@dataclass
+class InotifyHeader:
+    """
+    Class to store the header info.
+    """
+    wd: int
+    mask: int
+    cookie: int
+    len: int
+
+
+#########################################
+# Event class:
+@dataclass
+class InotifyEvent:
+    header: InotifyHeader
+    """The event header."""
+    type_names: list[str]
+    """List of event type names."""
+    directory: str
+    """Directory event happened in / to."""
+    filename: str
+    """The filename event happened to."""
+
+
+###########################################
+# Main Inotify class:
 class Inotify(object):
     def __init__(self, paths=[], block_duration_ms=_DEFAULT_POLL_BLOCK_DURATION_MILLISECONDS):
         self.__block_duration = block_duration_ms
@@ -127,7 +164,8 @@ class Inotify(object):
 
             inotify.calls.inotify_rm_watch(self.__inotify_fd, wd)
 
-    def _get_event_names(self, event_type):
+    @staticmethod
+    def _get_event_names(event_type):
         names = []
         for bit, name in inotify.constants.MASK_LOOKUP.items():
             if event_type & bit:
@@ -137,8 +175,7 @@ class Inotify(object):
                 if event_type == 0:
                     break
 
-        assert event_type == 0, \
-               "We could not resolve all event-types: (%d)" % (event_type,)
+        assert event_type == 0, "We could not resolve all event-types: (%d)" % (event_type,)
 
         return names
 
@@ -162,8 +199,8 @@ class Inotify(object):
             peek_slice = self.__buffer[:_STRUCT_HEADER_LENGTH]
 
             header_raw = struct.unpack(
-                            _HEADER_STRUCT_FORMAT,
-                            peek_slice)
+                _HEADER_STRUCT_FORMAT,
+                peek_slice)
 
             header = _INOTIFY_EVENT(*header_raw)
             type_names = self._get_event_names(header.mask)
@@ -182,15 +219,18 @@ class Inotify(object):
             path = self.__watches_r.get(header.wd)
             if path is not None:
                 filename_unicode = filename_bytes.decode('utf8')
-                yield (header, type_names, path, filename_unicode)
+                yield header, type_names, path, filename_unicode
 
             buffer_length = len(self.__buffer)
             if buffer_length < _STRUCT_HEADER_LENGTH:
                 break
 
-    def event_gen(
-            self, timeout_s=None, yield_nones=True, filter_predicate=None,
-            terminal_events=_DEFAULT_TERMINAL_EVENTS):
+    def event_gen(self,
+                  timeout_s=None,
+                  yield_nones: bool = True,
+                  filter_predicate=None,
+                  terminal_events=_DEFAULT_TERMINAL_EVENTS,
+                  yield_objects: bool = False) -> None:
         """Yield one event after another. If `timeout_s` is provided, we'll
         break when no event is received for that many seconds.
         """
@@ -199,7 +239,8 @@ class Inotify(object):
         # timeout. The former will always set this. The latter will never set
         # this.
         self.__last_success_return = None
-
+        _LOGGER.debug("timeout_s type: %s" % str(type(timeout_s)))
+        _LOGGER.debug("term_events = %s" % str(type(terminal_events)))
         last_hit_s = time.time()
         while True:
             block_duration_ms = self.__get_block_duration()
@@ -224,20 +265,22 @@ class Inotify(object):
             for _, event_type in events:
                 # First result is the file descriptor attached to inotify
 
-                for (header, type_names, path, filename) \
-                        in self._handle_inotify_event(self.__inotify_fd, event_type):
+                for (header, type_names, path, filename) in self._handle_inotify_event(self.__inotify_fd, event_type):
                     last_hit_s = time.time()
 
                     e = (header, type_names, path, filename)
                     for type_name in type_names:
-                        if filter_predicate is not None and \
-                           filter_predicate(type_name, e) is False:
-                             self.__last_success_return = (type_name, e)
-                             return
+                        if filter_predicate is not None and filter_predicate(type_name, e) is False:
+                            self.__last_success_return = (type_name, e)
+                            return
                         elif type_name in terminal_events:
                             raise TerminalEventException(type_name, e)
-
-                    yield e
+                    if yield_objects:
+                        header_obj = InotifyHeader(*header)
+                        event_obj = InotifyEvent(header_obj, type_names, path, filename)
+                        yield event_obj
+                    else:
+                        yield e
 
             if timeout_s is not None:
                 time_since_event_s = time.time() - last_hit_s
@@ -258,10 +301,7 @@ class _BaseTree(object):
 
         # No matter what we actually received as the mask, make sure we have
         # the minimum that we require to curate our list of watches.
-        self._mask = mask | \
-                        inotify.constants.IN_ISDIR | \
-                        inotify.constants.IN_CREATE | \
-                        inotify.constants.IN_DELETE
+        self._mask = mask | inotify.constants.IN_ISDIR | inotify.constants.IN_CREATE | inotify.constants.IN_DELETE
 
         self._i = Inotify(block_duration_ms=block_duration_ms)
 
@@ -282,17 +322,16 @@ class _BaseTree(object):
                     full_path = os.path.join(path, filename)
 
                     if (
-                        (header.mask & inotify.constants.IN_MOVED_TO) or
-                        (header.mask & inotify.constants.IN_CREATE)
-                       ) and \
-                       (
-                        os.path.exists(full_path) is True or
-                        ignore_missing_new_folders is False
-                       ):
+                            (header.mask & inotify.constants.IN_MOVED_TO) or
+                            (header.mask & inotify.constants.IN_CREATE)
+                    ) and \
+                            (
+                                    os.path.exists(full_path) is True or
+                                    ignore_missing_new_folders is False
+                            ):
                         _LOGGER.debug("A directory has been created. We're "
                                       "adding a watch on it (because we're "
                                       "being recursive): [%s]", full_path)
-
 
                         self._i.add_watch(full_path, self._mask)
 
@@ -373,7 +412,6 @@ class InotifyTrees(_BaseTree):
                     continue
 
                 q.append(entry_filepath)
-
 
         for path in found:
             self._i.add_watch(path, self._mask)
