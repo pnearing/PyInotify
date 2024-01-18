@@ -74,6 +74,9 @@ class InotifyHeader:
 # Event class:
 @dataclass
 class InotifyEvent:
+    """
+    Class to store an Inotify Event.
+    """
     header: InotifyHeader
     """The event header."""
     type_names: list[str]
@@ -82,6 +85,10 @@ class InotifyEvent:
     """Directory event happened in / to."""
     filename: str
     """The filename event happened to."""
+
+    @property
+    def full_path(self) -> str:
+        return os.path.join(self.directory, self.filename)
 
 
 ###########################################
