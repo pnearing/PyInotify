@@ -1,3 +1,4 @@
+from typing import Generator
 import logging
 import select
 import os
@@ -237,7 +238,9 @@ class Inotify(object):
                   yield_nones: bool = True,
                   filter_predicate=None,
                   terminal_events=_DEFAULT_TERMINAL_EVENTS,
-                  yield_objects: bool = False) -> None:
+                  yield_objects: bool = False) -> Generator[
+                                            tuple[tuple[int, int, int, int], list[str], str, str] | InotifyEvent,
+                                            None, None]:
         """Yield one event after another. If `timeout_s` is provided, we'll
         break when no event is received for that many seconds.
         """
